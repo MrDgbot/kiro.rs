@@ -7,6 +7,9 @@
 - **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
+- **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
+- **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
+- **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
@@ -60,7 +63,9 @@ cargo build --release
 ```
 ### 3. 凭证文件
 
-创建 `credentials.json` 凭证文件（从 Kiro IDE 获取）：
+创建 `credentials.json` 凭证文件（从 Kiro IDE 获取）。支持两种格式：
+
+#### 单凭据格式（旧格式，向后兼容）
 
 ```json
 {
@@ -73,6 +78,34 @@ cargo build --release
    "clientSecret": "如果你是 IdC 登录 需要配置这个"  // 可选, 不需要请删除
 }
 ```
+
+#### 多凭据格式（新格式，支持故障转移和自动回写）
+
+```json
+[
+   {
+      "refreshToken": "第一个凭据的刷新token",
+      "expiresAt": "2025-12-31T02:32:45.144Z",
+      "authMethod": "social",
+      "priority": 0
+   },
+   {
+      "refreshToken": "第二个凭据的刷新token",
+      "expiresAt": "2025-12-31T02:32:45.144Z",
+      "authMethod": "idc",
+      "clientId": "xxxxxxxxx",
+      "clientSecret": "xxxxxxxxx",
+      "priority": 1
+   }
+]
+```
+
+> **多凭据特性说明**：
+> - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
+> - 单凭据最多重试 3 次，单请求最多重试 9 次
+> - 自动故障转移到下一个可用凭据
+> - 多凭据格式下 Token 刷新后自动回写到源文件
+
 最小启动配置(social):
 ```json
 {
@@ -81,6 +114,7 @@ cargo build --release
    "authMethod": "social"
 }
 ```
+
 最小启动配置(idc):
 ```json
 {
@@ -141,6 +175,8 @@ curl http://127.0.0.1:8990/v1/messages \
 
 ### credentials.json
 
+支持单对象格式（向后兼容）或数组格式（多凭据）。
+
 | 字段 | 类型 | 描述                      |
 |------|------|-------------------------|
 | `accessToken` | string | OAuth 访问令牌（可选，可自动刷新）    |
@@ -150,6 +186,7 @@ curl http://127.0.0.1:8990/v1/messages \
 | `authMethod` | string | 认证方式（social 或 idc）      |
 | `clientId` | string | IdC 登录的客户端 ID（可选）      |
 | `clientSecret` | string | IdC 登录的客户端密钥（可选）      |
+| `priority` | number | 凭据优先级，数字越小越优先，默认为 0（多凭据格式时有效）|
 
 ## 模型映射
 
@@ -192,7 +229,9 @@ kiro-rs/
 │           └── crc.rs          # CRC 校验
 ├── Cargo.toml                  # 项目配置
 ├── config.example.json         # 配置示例
-└── credentials.json            # 凭证文件
+├── credentials.example.social.json   # Social 凭证示例
+├── credentials.example.idc.json      # IdC 凭证示例
+└── credentials.example.multiple.json # 多凭据示例
 ```
 
 ## 技术栈
