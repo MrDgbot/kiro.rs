@@ -19,6 +19,34 @@ use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
+/// API 调用错误类型
+///
+/// 区分不同的上游错误，让调用方可以返回合适的 HTTP 状态码
+#[derive(Debug)]
+pub enum ApiError {
+    /// 认证失败（401/403 或 Token 刷新失败）
+    AuthenticationFailed(String),
+    /// 额度用尽（402 MONTHLY_REQUEST_COUNT，所有凭据均已耗尽）
+    QuotaExhausted(String),
+    /// 请求本身有问题（400 Bad Request）
+    BadRequest(String),
+    /// 上游服务器错误 / 网络错误 / 其他瞬态错误
+    UpstreamError(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::AuthenticationFailed(msg) => write!(f, "{}", msg),
+            ApiError::QuotaExhausted(msg) => write!(f, "{}", msg),
+            ApiError::BadRequest(msg) => write!(f, "{}", msg),
+            ApiError::UpstreamError(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -255,7 +283,7 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> Result<reqwest::Response, ApiError> {
         self.call_api_with_retry(request_body, false).await
     }
 
@@ -272,7 +300,7 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> Result<reqwest::Response, ApiError> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -285,15 +313,15 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_mcp(&self, request_body: &str) -> Result<reqwest::Response, ApiError> {
         self.call_mcp_with_retry(request_body).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(&self, request_body: &str) -> Result<reqwest::Response, ApiError> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let mut last_error: Option<anyhow::Error> = None;
+        let mut last_error: Option<ApiError> = None;
 
         for attempt in 0..max_retries {
             // 获取调用上下文
@@ -301,7 +329,9 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
+                    last_error = Some(ApiError::AuthenticationFailed(format!(
+                        "获取凭据失败: {}", e
+                    )));
                     continue;
                 }
             };
@@ -310,14 +340,24 @@ impl KiroProvider {
             let headers = match self.build_mcp_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
-                    last_error = Some(e);
+                    last_error = Some(ApiError::UpstreamError(format!(
+                        "构建请求头失败: {}", e
+                    )));
                     continue;
                 }
             };
 
             // 发送请求
-            let response = match self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(ApiError::UpstreamError(format!(
+                        "创建 HTTP 客户端失败: {}", e
+                    )));
+                    continue;
+                }
+            };
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -332,7 +372,9 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    last_error = Some(e.into());
+                    last_error = Some(ApiError::UpstreamError(format!(
+                        "MCP 请求发送失败: {}", e
+                    )));
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -355,24 +397,34 @@ impl KiroProvider {
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(ApiError::QuotaExhausted(format!(
+                        "MCP 请求失败（所有凭据额度已用尽）: {} {}", status, body
+                    )));
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(ApiError::QuotaExhausted(format!(
+                    "MCP 请求失败: {} {}", status, body
+                )));
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                return Err(ApiError::BadRequest(format!(
+                    "MCP 请求失败: {} {}", status, body
+                )));
             }
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(ApiError::AuthenticationFailed(format!(
+                        "MCP 请求失败（所有凭据认证失败）: {} {}", status, body
+                    )));
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(ApiError::AuthenticationFailed(format!(
+                    "MCP 请求失败: {} {}", status, body
+                )));
                 continue;
             }
 
@@ -385,7 +437,9 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(ApiError::UpstreamError(format!(
+                    "MCP 请求失败: {} {}", status, body
+                )));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -394,18 +448,24 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                return Err(ApiError::BadRequest(format!(
+                    "MCP 请求失败: {} {}", status, body
+                )));
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error = Some(ApiError::UpstreamError(format!(
+                "MCP 请求失败: {} {}", status, body
+            )));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
 
         Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
+            ApiError::UpstreamError(format!(
+                "MCP 请求失败：已达到最大重试次数（{}次）", max_retries
+            ))
         }))
     }
 
@@ -419,10 +479,10 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> Result<reqwest::Response, ApiError> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let mut last_error: Option<anyhow::Error> = None;
+        let mut last_error: Option<ApiError> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -433,7 +493,9 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
+                    last_error = Some(ApiError::AuthenticationFailed(format!(
+                        "获取凭据失败: {}", e
+                    )));
                     continue;
                 }
             };
@@ -442,14 +504,24 @@ impl KiroProvider {
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
-                    last_error = Some(e);
+                    last_error = Some(ApiError::UpstreamError(format!(
+                        "构建请求头失败: {}", e
+                    )));
                     continue;
                 }
             };
 
             // 发送请求
-            let response = match self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(ApiError::UpstreamError(format!(
+                        "创建 HTTP 客户端失败: {}", e
+                    )));
+                    continue;
+                }
+            };
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -466,7 +538,9 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    last_error = Some(ApiError::UpstreamError(format!(
+                        "{} API 请求发送失败: {}", api_type, e
+                    )));
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -497,26 +571,24 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(ApiError::QuotaExhausted(format!(
+                        "{} API 请求失败（所有凭据额度已用尽）: {} {}",
+                        api_type, status, body
+                    )));
                 }
 
-                last_error = Some(anyhow::anyhow!(
+                last_error = Some(ApiError::QuotaExhausted(format!(
                     "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                    api_type, status, body
+                )));
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(ApiError::BadRequest(format!(
+                    "{} API 请求失败: {} {}", api_type, status, body
+                )));
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -531,20 +603,16 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(ApiError::AuthenticationFailed(format!(
+                        "{} API 请求失败（所有凭据认证失败）: {} {}",
+                        api_type, status, body
+                    )));
                 }
 
-                last_error = Some(anyhow::anyhow!(
+                last_error = Some(ApiError::AuthenticationFailed(format!(
                     "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                    api_type, status, body
+                )));
                 continue;
             }
 
@@ -558,12 +626,10 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!(
+                last_error = Some(ApiError::UpstreamError(format!(
                     "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                    api_type, status, body
+                )));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -572,7 +638,9 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(ApiError::BadRequest(format!(
+                    "{} API 请求失败: {} {}", api_type, status, body
+                )));
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -583,12 +651,10 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!(
+            last_error = Some(ApiError::UpstreamError(format!(
                 "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
+                api_type, status, body
+            )));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -596,11 +662,10 @@ impl KiroProvider {
 
         // 所有重试都失败
         Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
+            ApiError::UpstreamError(format!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
-                max_retries
-            )
+                api_type, max_retries
+            ))
         }))
     }
 

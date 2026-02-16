@@ -14,3 +14,12 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/acc.json
+/2.json
+*.zip
+/全部账号_*/
+/flowvpn-*
+.DS_Store
+.omc/
+.claude/
+deploy.zip
