@@ -485,6 +485,12 @@ impl KiroProvider {
         let mut last_error: Option<ApiError> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
+        tracing::info!(
+            "{} API 请求体大小: {:.1} KB",
+            api_type,
+            request_body.len() as f64 / 1024.0
+        );
+
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 

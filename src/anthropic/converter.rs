@@ -330,9 +330,12 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
-/// 提取工具结果内容
+/// 工具结果最大长度（30KB，超过则截断）
+const MAX_TOOL_RESULT_LENGTH: usize = 30_000;
+
+/// 提取工具结果内容（超长时截断）
 fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
+    let raw = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
@@ -345,6 +348,23 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         }
         Some(v) => v.to_string(),
         None => String::new(),
+    };
+
+    // 截断过长的工具结果（文件内容等）
+    if raw.len() > MAX_TOOL_RESULT_LENGTH {
+        match raw.char_indices().nth(MAX_TOOL_RESULT_LENGTH) {
+            Some((idx, _)) => {
+                tracing::debug!(
+                    "工具结果内容过长 ({} 字节)，截断到 {} 字符",
+                    raw.len(),
+                    MAX_TOOL_RESULT_LENGTH
+                );
+                format!("{}...\n[content truncated]", &raw[..idx])
+            }
+            None => raw,
+        }
+    } else {
+        raw
     }
 }
 
@@ -719,19 +739,9 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
+    // 剥离 thinking 内容：历史中的推理过程不需要发给上游，大幅减小请求体
     // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    let final_content = if text_content.is_empty() && !tool_uses.is_empty() {
         ".".to_string()
     } else {
         text_content
