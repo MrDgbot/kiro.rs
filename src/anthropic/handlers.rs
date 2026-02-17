@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking, get_context_window_size};
 use super::websearch;
 use crate::kiro::provider::ApiError;
 
@@ -54,6 +54,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Sonnet 4.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-sonnet-4-5-20250929-thinking".to_string(),
@@ -63,6 +66,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-opus-4-5-20251101".to_string(),
@@ -72,6 +78,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Opus 4.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-opus-4-5-20251101-thinking".to_string(),
@@ -81,6 +90,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Opus 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-opus-4-6".to_string(),
@@ -90,6 +102,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(1_000_000),
+            max_completion_tokens: Some(128_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
@@ -99,6 +114,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(1_000_000),
+            max_completion_tokens: Some(128_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-haiku-4-5-20251001".to_string(),
@@ -108,6 +126,9 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
         },
         Model {
             id: "claude-haiku-4-5-20251001-thinking".to_string(),
@@ -117,6 +138,58 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
+        },
+        // Agentic 变体
+        Model {
+            id: "claude-sonnet-4-5-20250929-agentic".to_string(),
+            object: "model".to_string(),
+            created: 1727568000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5 (Agentic)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
+        },
+        Model {
+            id: "claude-opus-4-5-20251101-agentic".to_string(),
+            object: "model".to_string(),
+            created: 1730419200,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5 (Agentic)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
+        },
+        Model {
+            id: "claude-opus-4-6-agentic".to_string(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.6 (Agentic)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+            context_length: Some(1_000_000),
+            max_completion_tokens: Some(128_000),
+            thinking: Some(true),
+        },
+        Model {
+            id: "claude-haiku-4-5-20251001-agentic".to_string(),
+            object: "model".to_string(),
+            created: 1727740800,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 4.5 (Agentic)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+            context_length: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            thinking: Some(true),
         },
     ];
 
@@ -384,9 +457,6 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200k tokens）
-const CONTEXT_WINDOW_SIZE: i32 = 200_000;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -473,9 +543,9 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            // 公式: percentage * 200000 / 100 = percentage * 2000
+                            let context_window = get_context_window_size(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (CONTEXT_WINDOW_SIZE as f64)
+                                * (context_window as f64)
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
@@ -484,9 +554,10 @@ async fn handle_non_stream_request(
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {} (context_window: {})",
                                 context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                actual_input_tokens,
+                                context_window
                             );
                         }
                         Event::Exception { exception_type, .. } => {
