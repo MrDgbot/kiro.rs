@@ -476,6 +476,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 
     let converted: Vec<Tool> = tools
         .iter()
+        .filter(|t| !t.is_web_search())
         .map(|t| {
             let mut description = t.description.clone();
 
@@ -731,7 +732,7 @@ fn convert_assistant_message(
             format!("<thinking>{}</thinking>", thinking_content)
         }
     } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
+        ".".to_string()
     } else {
         text_content
     };
