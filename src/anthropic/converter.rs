@@ -27,6 +27,30 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// Agentic 模型专用分块写入系统提示
+const KIRO_AGENTIC_SYSTEM_PROMPT: &str = "\
+# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)\n\
+You MUST follow these rules for ALL file operations. Violation causes server timeouts and task failure.\n\
+\n\
+## ABSOLUTE LIMITS\n\
+- **MAXIMUM 350 LINES** per single write/edit operation - NO EXCEPTIONS\n\
+- **RECOMMENDED 300 LINES** or less for optimal performance\n\
+- **NEVER** write entire files in one operation if >300 lines\n\
+\n\
+## MANDATORY CHUNKED WRITE STRATEGY\n\
+\n\
+### For NEW FILES (>300 lines total):\n\
+1. FIRST: Write initial chunk (first 250-300 lines) using write_to_file/fsWrite\n\
+2. THEN: Append remaining content in 250-300 line chunks using file append operations\n\
+3. REPEAT: Continue appending until complete\n\
+\n\
+### For EDITING EXISTING FILES:\n\
+1. Use surgical edits - change ONLY what's needed\n\
+2. NEVER rewrite entire files - use incremental modifications\n\
+3. Split large refactors into multiple small, focused edits\n\
+\n\
+REMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -49,6 +73,11 @@ pub fn map_model(model: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// 检查模型名是否为 agentic 变体
+pub fn is_agentic_model(model: &str) -> bool {
+    model.to_lowercase().contains("agentic")
 }
 
 /// 转换结果
@@ -445,7 +474,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
         return Vec::new();
     };
 
-    tools
+    let converted: Vec<Tool> = tools
         .iter()
         .map(|t| {
             let mut description = t.description.clone();
@@ -475,7 +504,10 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 },
             }
         })
-        .collect()
+        .collect();
+
+    // 如果工具总大小超过阈值，进行压缩
+    super::tool_compression::compress_tools_if_needed(&converted)
 }
 
 /// 生成thinking标签前缀
@@ -523,7 +555,12 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
         if !system_content.is_empty() {
             // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            let mut system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+
+            // 如果是 agentic 模型，追加专用分块写入系统提示
+            if is_agentic_model(&req.model) {
+                system_content = format!("{}\n{}", system_content, KIRO_AGENTIC_SYSTEM_PROMPT);
+            }
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
